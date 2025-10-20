@@ -1,0 +1,438 @@
+name: Apply EA Patches (cycles 1–5)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Add tools folder if missing
+        run: mkdir -p tools
+
+      - name: Write patcher.py
+        run: |
+          cat > tools/patcher.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import re, sys
+          from pathlib import Path
+          from datetime import datetime
+
+          BASE = Path(".")
+          TS = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+          FILES = {
+              "ea": BASE/"RealAccountEA_v1.mq5",
+              "suite": BASE/"IndicatorSuite_refactored_complete_v9.mqh",
+              "dailylog": BASE/"DailyLog_v1.mqh",
+              "stops": BASE/"StopManager_v1.mqh",
+              "liq": BASE/"LiquidationManager_v1.mqh",
+          }
+
+          notes = []
+
+          def read_auto(p: Path) -> str:
+              raw = p.read_bytes()
+              for enc in ("utf-8","utf-16-le","utf-16-be","latin-1"):
+                  try:
+                      return raw.decode(enc)
+                  except Exception:
+                      continue
+              return raw.decode("utf-8","ignore")
+
+          def write_utf8(p: Path, text: str):
+              p.write_text(text, encoding="utf-8")
+
+          def ensure_present():
+              missing = [str(p) for p in FILES.values() if not p.exists()]
+              if missing:
+                  print("Missing files:", *missing, sep="\n- ")
+                  sys.exit(1)
+
+          def patch_hardening_ea(text: str) -> str:
+              orig = text
+              text = text.replace("SetRule(name, 30.0, 70.0)", "SetRule(name, 70.0, 30.0)")
+
+              sig = "double CalcVolumeByRisk(double riskPercent, const string symbol"
+              idx = text.find(sig)
+              if idx != -1:
+                  i = text.find("{", idx)
+                  depth=0; end=None
+                  for j in range(i, len(text)):
+                      if text[j]=="{": depth+=1
+                      elif text[j]=="}":
+                          depth-=1
+                          if depth==0: end=j+1; break
+                  func = text[idx:end]
+
+                  if "SL ajustado por segurança" not in func:
+                      func = func.replace(
+                          "double sl_points = stopPoints;",
+                          "double sl_points = stopPoints;\n"
+                          "   if(sl_points <= 0.0)\n"
+                          "   {\n"
+                          "      sl_points = (InpDefaultSLPoints > 0.0 ? InpDefaultSLPoints : 300.0);\n"
+                          "      g_log.Logs(true,true,\"[Risk] SL ajustado por segurança: \", DoubleToString(sl_points, 2));\n"
+                          "   }"
+                      )
+
+                  import re as _re
+                  func = _re.sub(
+                      r'double\s+price_for_margin\s*=\s*SymbolInfoDouble\(\s*symbol\s*,\s*SYMBOL_BID\s*\)\s*;',
+                      'double price_for_margin = SymbolInfoDouble(symbol, SYMBOL_BID);\n'
+                      '   double __ask_for_margin = SymbolInfoDouble(symbol, SYMBOL_ASK);\n'
+                      '   if(MathIsValidNumber(__ask_for_margin) && __ask_for_margin > price_for_margin) price_for_margin = __ask_for_margin;',
+                      func
+                  )
+
+                  func = func.replace(
+                      "if(isFuture && vol_step2>=1.0) { v2 = MathFloor(v2/vol_step2)*vol_step2; }\n   return NormalizeDouble(v2, digits2);",
+                      "if(isFuture && vol_step2>=1.0) { v2 = MathFloor(v2/vol_step2)*vol_step2; }\n"
+                      "   if(v2 < vol_min2) v2 = vol_min2;\n"
+                      "   return NormalizeDouble(v2, digits2);"
+                  )
+
+                  text = text[:idx] + func + text[end:]
+
+              if text != orig:
+                  notes.append("EA: hardening — RSI 70/30, SL fallback, margem conservadora, volume futuro inteiro e >= min.")
+              return text
+
+          def patch_cycle1_ea(text: str) -> str:
+              orig = text
+              if "InpMaxSpreadPoints" not in text:
+                  text = text.replace("//--- input parameters",
+                                      "//--- input parameters\\n"
+                                      "input int     InpMaxSpreadPoints = 50;\\n"
+                                      "input int     InpMinValidIndicators = 2;\\n"
+                                      "input bool    InpAllowTradingInTester = false;\\n")
+              if "bool CanTradeSymbol(const string sym)" not in text:
+                  injection = """
+          // --- Guards operacionais (spread, tester, modo full, sessão, indicadores)
+          int CountValidIndicatorsFor(const string sym)
+          {
+             string names[]; g_im.ListIndicatorsForSymbol(sym, names);
+             int ok=0;
+             for(int i=0;i<ArraySize(names);i++){ double v=g_im.Value(names[i]); if(MathIsValidNumber(v) && v!=EMPTY_VALUE) ok++; }
+             return ok;
+          }
+          double GetSpreadPoints(const string sym)
+          {
+             double bid=SymbolInfoDouble(sym,SYMBOL_BID), ask=SymbolInfoDouble(sym,SYMBOL_ASK), point=SymbolInfoDouble(sym,SYMBOL_POINT);
+             if(!(MathIsValidNumber(bid)&&MathIsValidNumber(ask)&&MathIsValidNumber(point)&&point>0.0)) return 0.0;
+             return (ask-bid)/point;
+          }
+          bool IsTradingSessionOpen(const string sym){ return true; } // stub conservador
+          bool CanTradeSymbol(const string sym)
+          {
+             if((bool)MQLInfoInteger(MQL_TESTER) || (bool)MQLInfoInteger(MQL_OPTIMIZATION))
+             { if(!InpAllowTradingInTester){ g_log.Logs(true,true,"[GUARD] Tester/Optimization bloqueado"); return false; } }
+             long mode=(long)SymbolInfoInteger(sym,SYMBOL_TRADE_MODE);
+             if(mode!=SYMBOL_TRADE_MODE_FULL){ g_log.Logs(true,true,"[GUARD] Trade mode != FULL ",sym); return false; }
+             if(!IsTradingSessionOpen(sym)){ g_log.Logs(true,true,"[GUARD] Sessão fechada ",sym); return false; }
+             double spread=GetSpreadPoints(sym);
+             if(InpMaxSpreadPoints>0 && spread>(double)InpMaxSpreadPoints){ g_log.Logs(true,true,"[GUARD] Spread alto ",sym); return false; }
+             if(CountValidIndicatorsFor(sym)<InpMinValidIndicators){ g_log.Logs(true,true,"[GUARD] Indicadores insuficientes ",sym); return false; }
+             return true;
+          }
+          """
+                  last_inc = 0
+                  for m in re.finditer(r'^\\s*#include\\s+.+$', text, flags=re.M): last_inc = m.end()
+                  text = text[:last_inc] + "\\n" + injection + "\\n" + text[last_inc:]
+
+                  m = re.search(r'void\\s+OnTick\\s*\\(\\s*\\)\\s*\\{', text)
+                  if m:
+                      start = m.end()
+                      loopm = re.search(r'for\\s*\\(\\s*int\\s+sidx\\s*=\\s*0;[^\\{]+\\{', text[start:])
+                      if loopm:
+                          inj_point = start + loopm.end()
+                          text = text[:inj_point] + '\\n      if(!CanTradeSymbol(sym)) { continue; }\\n' + text[inj_point:]
+              if text != orig:
+                  notes.append("EA: Cycle 1 — guards (spread/tester/mode/sessão/indicadores) e checagem cedo no OnTick.")
+              return text
+
+          def patch_cycle2_suite(text: str) -> str:
+              orig = text
+              text = text.replace('Log("Resolve miss " + s);', 'Log("Resolve miss " + s + " (verifique MarketWatch ou símbolo incorreto)");')
+              text = text.replace("push(x);\\n   return x.enabled;", "if(!x.enabled && m_log != NULL) (*m_log).Logs(true,true,\\"[WARN] Indicador desabilitado ficará no store: \\", name);\\n   push(x);\\n   return x.enabled;")
+              if text != orig:
+                  notes.append("Suite: Cycle 2 — logs de resolução e aviso de indicador desabilitado.")
+              return text
+
+          def patch_dailylog(text: str) -> str:
+              idx = text.find("void Logs(")
+              if idx != -1:
+                  brace = text.find("{", idx)
+                  if brace != -1 and "IsTesterOrOptimizationMode()" not in text[brace:brace+200]:
+                      text = text[:brace+1] + '\\n      if(IsTesterOrOptimizationMode()) chartAdd = true;\\n' + text[brace+1:]
+                      notes.append("DailyLog: chartAdd=true no tester/optimization.")
+              return text
+
+          def patch_cycle3_stops(text: str) -> str:
+              orig = text
+              if "EnsureFreezeLevelOK" not in text:
+                  pos = text.find("double EnsureMinimalDistance")
+                  if pos != -1:
+                      br = text.find("{", pos)
+                      depth=0; end=None
+                      for i in range(br, len(text)):
+                          if text[i]=="{": depth+=1
+                          elif text[i]=="}":
+                              depth-=1
+                              if depth==0: end=i+1; break
+                      add = """
+          bool EnsureFreezeLevelOK(const string symbol, const double new_price, const int dir)
+          {
+             long freeze_lvl = (long)SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+             double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+             if(freeze_lvl <= 0 || point <= 0.0) return true;
+             double min_freeze = freeze_lvl * point;
+             double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+             double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+             double ref = (dir > 0 ? bid : ask);
+             if(!(MathIsValidNumber(ref) && MathIsValidNumber(new_price))) return true;
+             if(dir > 0) { if((ref - new_price) < min_freeze) return false; }
+             else        { if((new_price - ref) < min_freeze) return false; }
+             return true;
+          }
+          """
+                      text = text[:end] + add + text[end:]
+                  text = text.replace(
+                      "req.sl = new_sl;\\n            req.tp = new_tp;",
+                      "if(new_sl>0 && !EnsureFreezeLevelOK(symbol, new_sl, (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY? +1 : -1)))\\n"
+                      "               { Log(\\"FreezeLevel bloqueou SL — adiando modificação\\"); return false; }\\n"
+                      "            if(new_tp>0 && !EnsureFreezeLevelOK(symbol, new_tp, (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY? +1 : -1)))\\n"
+                      "               { Log(\\"FreezeLevel bloqueou TP — adiando modificação\\"); return false; }\\n"
+                      "            req.sl = new_sl;\\n            req.tp = new_tp;"
+                  )
+                  if text != orig:
+                      notes.append("StopManager: Cycle 3 — checagem de FREEZE antes de modificar SL/TP.")
+              return text
+
+          def patch_cycle3_ea_diag(text: str) -> str:
+              if "void DebugSymbolLine" not in text:
+                  diag = """
+          void DebugSymbolLine(const string sym)
+          {
+             double spread = GetSpreadPoints(sym);
+             int    valid  = CountValidIndicatorsFor(sym);
+             double vol_ex = CalcVolumeByRisk(InpRiskPercent, sym, InpDefaultSLPoints);
+             g_log.Logs(true, true, "[DBG] ", sym, " spread=", DoubleToString(spread,1),
+                        " valid=", IntegerToString(valid), " vol_est=", DoubleToString(vol_ex,2));
+          }
+          """
+                  pos = text.find("bool CanTradeSymbol")
+                  if pos != -1:
+                     endp = text.find("}", pos)
+                     text = text[:endp+1] + "\\n" + diag + "\\n" + text[endp+1:]
+                     m = re.search(r'void\\s+OnTick\\s*\\(\\s*\\)\\s*\\{', text)
+                     if m:
+                         start = m.end()
+                         loopm = re.search(r'for\\s*\\(\\s*int\\s+sidx\\s*=\\s*0;[^\\{]+\\{', text[start:])
+                         if loopm:
+                             inj = start + loopm.end()
+                             text = text[:inj] + '\\n      DebugSymbolLine(sym);\\n' + text[inj:]
+                  notes.append("EA: Cycle 3 — diagnóstico [DBG] por símbolo a cada tick.")
+              return text
+
+          def patch_cycle4_suite_signalx(text: str) -> str:
+              anchor = "void ListIndicatorsForSymbol(const string sym,string &out[]){"
+              if anchor in text and "int SignalX(" not in text:
+                  insert_at = text.find(anchor)
+                  signalx = """
+          int SignalX(const string ind_name)
+          {
+             if(StringLen(ind_name) < 4) return 0;
+             double v00 = m_store.ValueByName(ind_name, 0, 0);
+             double v01 = m_store.ValueByName(ind_name, 0, 1);
+             if(!MathIsValidNumber(v00) || !MathIsValidNumber(v01)) return 0;
+
+             if(StringFind(ind_name, "RSI_") == 0)
+             {
+                if(v01 < 30.0 && v00 >= 30.0) return +1;
+                if(v01 > 70.0 && v00 <= 70.0) return -1;
+                return 0;
+             }
+             if(StringFind(ind_name, "MACD_") == 0)
+             {
+                double h0 = m_store.ValueByName(ind_name, 2, 0);
+                double h1 = m_store.ValueByName(ind_name, 2, 1);
+                if(!MathIsValidNumber(h0) || !MathIsValidNumber(h1)) return 0;
+                if(h1 <= 0.0 && h0 > 0.0) return +1;
+                if(h1 >= 0.0 && h0 < 0.0) return -1;
+                return 0;
+             }
+             if(StringFind(ind_name, "CCI_") == 0)
+             {
+                if(v01 < -100.0 && v00 >= -100.0) return +1;
+                if(v01 >  100.0 && v00 <=  100.0) return -1;
+                if(v01 < 0.0 && v00 >= 0.0) return +1;
+                if(v01 > 0.0 && v00 <= 0.0) return -1;
+                return 0;
+             }
+             double v = v00;
+             return m_rules.Eval(v, ind_name);
+          }
+          """
+                  text = text[:insert_at] + signalx + text[insert_at:]
+              text = text.replace(
+                  "int    Signal(const string ind_name){ double v=m_store.ValueByName(ind_name,0,0); return m_rules.Eval(v,ind_name); }",
+                  "int    Signal(const string ind_name){ return SignalX(ind_name); }"
+              )
+              return text
+
+          def patch_cycle4_ea_postsend(text: str) -> str:
+              start = text.find("bool OpenMarketOrder(int type, double volume, const string symbol)")
+              if start != -1 and "__post_send_sl_tp__" not in text:
+                  send_pos = text.find("if(!OrderSend(req, res))", start)
+                  end_if = text.find("}", send_pos)
+                  inj_after = text.find("\\n", end_if+1)
+                  post = """
+          // __post_send_sl_tp__: aplicar SL/TP imediatamente após entrada
+          if(PositionSelect(symbol))
+          {
+             ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+             int ptype = (int)PositionGetInteger(POSITION_TYPE);
+             double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+             int dir = (ptype == POSITION_TYPE_BUY ? +1 : -1);
+             double slp = InpDefaultSLPoints, tpp = InpDefaultTPPoints;
+             if(slp > 0.0 || tpp > 0.0)
+             {
+                double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+                double sl_price = (slp > 0.0 ? (entry - dir * slp * point) : 0.0);
+                double tp_price = (tpp > 0.0 ? (entry + dir * tpp * point) : 0.0);
+                if(slp > 0.0) sl_price = g_stops.EnsureMinimalDistance(symbol, sl_price, dir);
+                if(tpp > 0.0) tp_price = g_stops.EnsureMinimalDistance(symbol, tp_price, -dir);
+                g_stops.ModifyPositionStops(ticket, symbol, sl_price, tp_price);
+             }
+          }
+          """
+                  text = text[:inj_after] + post + text[inj_after:]
+              return text
+
+          def patch_cycle5_ea_weights_hud(text: str) -> str:
+              orig = text
+              if "InpWeightM30" not in text:
+                  text = text.replace("//--- input parameters",
+                                      "//--- input parameters\\n"
+                                      "input double InpWeightM30 = 1.0;\\n"
+                                      "input double InpWeightH1  = 2.0;\\n"
+                                      "input double InpWeightD1  = 3.0;\\n"
+                                      "input int    InpHUDCorner = 0;\\n")
+              if "double WeightedVote" not in text:
+                  helper = """
+          double WeightedVote(const string sym)
+          {
+             string list[]; g_im.ListIndicatorsForSymbol(sym, list);
+             double sumVotes=0.0, sumWeights=0.0;
+             for(int i=0;i<ArraySize(list);i++)
+             {
+                string n=list[i];
+                int sig = g_im.Signal(n);
+                if(sig==0) continue;
+                double w=1.0;
+                if(StringFind(n,"M30@")>=0) w=InpWeightM30;
+                else if(StringFind(n,"H1@")>=0) w=InpWeightH1;
+                else if(StringFind(n,"D1@")>=0) w=InpWeightD1;
+                sumVotes += sig*w; sumWeights += w;
+             }
+             if(sumWeights==0.0) return 0.0;
+             return sumVotes/sumWeights;
+          }
+          """
+                  pos = text.find("bool CanTradeSymbol")
+                  if pos != -1:
+                      endp = text.find("}", pos)
+                      text = text[:endp+1] + "\\n" + helper + "\\n" + text[endp+1:]
+              if "void DrawHUD" not in text:
+                  hud = """
+          void DrawHUD()
+          {
+             string all[]; ArrayResize(all,0);
+             g_im.ListSymbols(all);
+             int corner=InpHUDCorner;
+             for(int i=0;i<ArraySize(all);i++)
+             {
+                string s=all[i];
+                double vote=WeightedVote(s);
+                string txt = s + " vote=" + DoubleToString(vote,2);
+                string name="HUD_"+s;
+                color c=clrSilver;
+                if(vote>0.2) c=clrLime; else if(vote<-0.2) c=clrRed;
+                ObjectCreate(0,name,OBJ_LABEL,0,0,0);
+                ObjectSetInteger(0,name,OBJPROP_CORNER,corner);
+                ObjectSetInteger(0,name,OBJPROP_XDISTANCE,20);
+                ObjectSetInteger(0,name,OBJPROP_YDISTANCE,20 + 15*i);
+                ObjectSetInteger(0,name,OBJPROP_COLOR,c);
+                ObjectSetInteger(0,name,OBJPROP_FONTSIZE,10);
+                ObjectSetString(0,name,OBJPROP_TEXT,txt);
+             }
+          }
+          """
+                  text += "\\n" + hud
+              if "DrawHUD();" not in text:
+                  m = re.search(r'void\\s+OnTick\\s*\\(\\s*\\)\\s*\\{', text)
+                  if m:
+                      start = m.end()
+                      close = text.find("}", start)
+                      text = text[:close] + "\\n   DrawHUD();\\n" + text[close:]
+              if text != orig:
+                  notes.append("EA: Cycle 5 — pesos por timeframe + HUD.")
+              return text
+
+          def main():
+              ensure_present()
+
+              ea = read_auto(FILES["ea"])
+              suite = read_auto(FILES["suite"])
+              dailylog = read_auto(FILES["dailylog"])
+              stops = read_auto(FILES["stops"])
+
+              ea = patch_hardening_ea(ea)
+              ea = patch_cycle1_ea(ea)
+              suite = patch_cycle2_suite(suite)
+              dailylog = patch_dailylog(dailylog)
+              stops = patch_cycle3_stops(stops)
+              ea = patch_cycle3_ea_diag(ea)
+              suite = patch_cycle4_suite_signalx(suite)
+              ea = patch_cycle4_ea_postsend(ea)
+              ea = patch_cycle5_ea_weights_hud(ea)
+
+              Path("PATCH_NOTES.md").write_text(
+                  "# Patch cycles 1–5 applied at " + TS + "\\n- " + "\\n- ".join(notes) + "\\n",
+                  encoding="utf-8"
+              )
+
+              # write back
+              (FILES["ea"]).write_text(ea, encoding="utf-8")
+              (FILES["suite"]).write_text(suite, encoding="utf-8")
+              (FILES["dailylog"]).write_text(dailylog, encoding="utf-8")
+              (FILES["stops"]).write_text(stops, encoding="utf-8")
+
+              print("OK patches: ", len(notes))
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: Run patcher
+        run: python tools/patcher.py
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/patch-cycles-1-5
+          commit-message: "Apply EA hardening patches (cycles 1–5)"
+          title: "Apply EA hardening patches (cycles 1–5)"
+          body: |
+            This PR applies cycles 1–5: guards, hardening, freeze-level stops, crossover signals, and weighted vote + HUD.
+          labels: enhancement, automated
